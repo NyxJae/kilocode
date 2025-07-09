@@ -4,7 +4,7 @@ import { useDebounce } from "react-use"
 import { VSCodeButtonLink } from "../common/VSCodeButtonLink"
 import { VSCodeLink, VSCodeTextField } from "@vscode/webview-ui-toolkit/react"
 
-import { getKiloCodeBackendAuthUrl } from "../kilocode/helpers" // kilocode_change
+import { getKiloCodeBackendSignInUrl } from "../kilocode/helpers" // kilocode_change
 
 import {
 	type ProviderName,
@@ -376,6 +376,34 @@ const ApiOptions = ({
 					<div style={{ marginTop: "0px" }} className="text-sm text-vscode-descriptionForeground -mt-2">
 						You get $20 for free!
 					</div>
+					<div>
+						<label className="block font-medium -mb-2">{t("kilocode:settings.provider.account")}</label>
+					</div>
+					{!hideKiloCodeButton &&
+						(apiConfiguration.kilocodeToken ? (
+							<div>
+								<Button
+									variant="secondary"
+									onClick={async () => {
+										setApiConfigurationField("kilocodeToken", "")
+
+										vscode.postMessage({
+											type: "upsertApiConfiguration",
+											text: currentApiConfigName,
+											apiConfiguration: {
+												...apiConfiguration,
+												kilocodeToken: "",
+											},
+										})
+									}}>
+									{t("kilocode:settings.provider.logout")}
+								</Button>
+							</div>
+						) : (
+							<VSCodeButtonLink variant="secondary" href={getKiloCodeBackendSignInUrl(uriScheme, uiKind)}>
+								{t("kilocode:settings.provider.login")}
+							</VSCodeButtonLink>
+						))}
 
 					<VSCodeTextField
 						value={apiConfiguration?.kilocodeToken || ""}
@@ -398,32 +426,6 @@ const ApiOptions = ({
 						serviceUrl="https://kilocode.ai"
 						organizationAllowList={organizationAllowList}
 					/>
-
-					{!hideKiloCodeButton &&
-						(apiConfiguration.kilocodeToken ? (
-							<div>
-								<Button
-									variant="secondary"
-									onClick={async () => {
-										setApiConfigurationField("kilocodeToken", "")
-
-										vscode.postMessage({
-											type: "upsertApiConfiguration",
-											text: currentApiConfigName,
-											apiConfiguration: {
-												...apiConfiguration,
-												kilocodeToken: "",
-											},
-										})
-									}}>
-									{t("kilocode:settings.provider.logout")}
-								</Button>
-							</div>
-						) : (
-							<VSCodeButtonLink variant="secondary" href={getKiloCodeBackendAuthUrl(uriScheme, uiKind)}>
-								{t("kilocode:settings.provider.login")}
-							</VSCodeButtonLink>
-						))}
 				</>
 			)}
 			{/* kilocode_change end */}

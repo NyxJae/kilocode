@@ -1,44 +1,26 @@
+// kilocode_change new file
+
 import * as vscode from "vscode"
 import { buildApiHandler, ApiHandler } from "../../api"
 import { CodeContext, ContextGatherer } from "./ContextGatherer"
-import { holeFillerTemplate } from "./templating/AutocompleteTemplate"
 import { ContextProxy } from "../../core/config/ContextProxy"
-import { generateImportSnippets, generateDefinitionSnippets } from "./context/snippetProvider"
-import { LRUCache } from "lru-cache"
 import { createDebouncedFn } from "./utils/createDebouncedFn"
 import { AutocompleteDecorationAnimation } from "./AutocompleteDecorationAnimation"
 import { isHumanEdit } from "./utils/EditDetectionUtils"
 import { ExperimentId } from "@roo-code/types"
-import { ClineProvider } from "../../core/webview/ClineProvider"
+import { EXPERIMENT_IDS } from "../../shared/experiments"
+import { AutocompleteCache } from "./AutocompleteCache"
+import { holeFillerStrategy } from "./strategies/holeFiller"
+import { createInlineCompletionItem } from "./AutocompleteActions"
+import { processTextInsertion } from "./utils/CompletionTextProcessor"
+import { AutocompleteStatusBar } from "./AutocompleteStatusBar"
+import { ProviderSettingsManager } from "../../core/config/ProviderSettingsManager"
+import { getAutocompleteConfiguration } from "./utils/autocompleteConfig"
+import { t } from "../../i18n"
 
 export const UI_UPDATE_DEBOUNCE_MS = 250
 export const BAIL_OUT_TOO_MANY_LINES_LIMIT = 100
 export const MAX_COMPLETIONS_PER_CONTEXT = 5 // Per-given prefix/suffix lines, how many different per-line options to cache
-
-// const DEFAULT_MODEL = "mistralai/codestral-2501"
-const DEFAULT_MODEL = "google/gemini-2.5-flash-preview-05-20"
-
-export function processModelResponse(responseText: string): string {
-	const fullMatch = /(<COMPLETION>)?([\s\S]*?)(<\/COMPLETION>|$)/.exec(responseText)
-	if (!fullMatch) {
-		return responseText
-	}
-	if (fullMatch[2].endsWith("</COMPLETION>")) {
-		return fullMatch[2].slice(0, -"</COMPLETION>".length)
-	}
-	return fullMatch[2]
-}
-
-/**
- * Generates a cache key based on context's preceding and following lines
- * This is used to identify when we can reuse a previous completion
- */
-function generateCacheKey({ precedingLines, followingLines }: CodeContext): string {
-	const maxLinesToConsider = 5
-	const precedingContext = precedingLines.slice(-maxLinesToConsider).join("\n")
-	const followingContext = followingLines.slice(0, maxLinesToConsider).join("\n")
-	return `${precedingContext}|||${followingContext}`
-}
 
 /**
  * Sets up autocomplete with experiment flag checking.
@@ -48,20 +30,23 @@ function generateCacheKey({ precedingLines, followingLines }: CodeContext): stri
 export function registerAutocomplete(context: vscode.ExtensionContext): void {
 	let autocompleteDisposable: vscode.Disposable | null = null
 	let isCurrentlyEnabled = false
+	let currentConfigId: string | undefined = undefined
 
-	// Function to check experiment flag and update provider
 	const checkAndUpdateProvider = () => {
 		const experiments =
 			(ContextProxy.instance?.getGlobalState("experiments") as Record<ExperimentId, boolean>) ?? {}
-		const shouldBeEnabled = experiments.autocomplete ?? false
+		const shouldBeEnabled = experiments[EXPERIMENT_IDS.AUTOCOMPLETE] ?? false
+		const newConfigId = ContextProxy.instance?.getValues?.()?.autocompleteApiConfigId
 
-		// Only take action if the state has changed
-		if (shouldBeEnabled !== isCurrentlyEnabled) {
-			console.log(`🚀🔍 Autocomplete experiment flag changed to: ${shouldBeEnabled}`)
+		const experimentChanged = shouldBeEnabled !== isCurrentlyEnabled
+		const configChanged = newConfigId !== currentConfigId
 
+		if (experimentChanged || (shouldBeEnabled && configChanged)) {
 			autocompleteDisposable?.dispose()
 			autocompleteDisposable = shouldBeEnabled ? setupAutocomplete(context) : null
+
 			isCurrentlyEnabled = shouldBeEnabled
+			currentConfigId = newConfigId
 		}
 	}
 
@@ -78,34 +63,40 @@ export function registerAutocomplete(context: vscode.ExtensionContext): void {
 }
 
 function setupAutocomplete(context: vscode.ExtensionContext): vscode.Disposable {
-	// State
-	let enabled = true // User toggle state (default to enabled)
+	let enabled = true
 	let activeRequestId: string | null = null
-	let isBackspaceOperation = false // Flag to track backspace operations
-	let justAcceptedSuggestion = false // Flag to track if a suggestion was just accepted
-	let lastCompletionCost = 0 // Track the cost of the last completion
-	let totalSessionCost = 0 // Track the total cost of all completions in the session
+	let isBackspaceOperation = false
+	let justAcceptedSuggestion = false
+	let lastCompletionCost = 0
+	let totalSessionCost = 0
 
-	// LRU Cache for completions
-	const completionsCache = new LRUCache<string, string[]>({
-		max: 50,
-		ttl: 1000 * 60 * 60 * 24, // Cache for 24 hours
-	})
+	let apiHandler: ApiHandler | null = null
+	const providerSettingsManager = new ProviderSettingsManager(context)
 
-	// Services
+	const autocompleteCache = new AutocompleteCache()
 	const contextGatherer = new ContextGatherer()
 	const animationManager = AutocompleteDecorationAnimation.getInstance()
+	const statusBar = new AutocompleteStatusBar({ enabled })
 
-	// Initialize API handler only if we have a valid token
-	let apiHandler: ApiHandler | null = null
-	const kilocodeToken = ContextProxy.instance.getProviderSettings().kilocodeToken
-
-	if (kilocodeToken) {
-		apiHandler = buildApiHandler({
-			apiProvider: "kilocode",
-			kilocodeToken,
-			kilocodeModel: DEFAULT_MODEL,
+	const updateStatusBar = () => {
+		statusBar.update({
+			enabled,
+			totalSessionCost,
+			lastCompletionCost,
+			model: apiHandler?.getModel().id || "default",
+			hasValidToken: apiHandler !== null,
 		})
+	}
+
+	const updateApiHandler = async (providerSettingsManager: ProviderSettingsManager) => {
+		try {
+			const autocompleteConfig = await getAutocompleteConfiguration(providerSettingsManager)
+			apiHandler = autocompleteConfig ? buildApiHandler(autocompleteConfig) : null
+		} catch (error) {
+			console.warn("Failed to update autocomplete API handler:", error)
+			apiHandler = null
+		}
+		updateStatusBar() // Update status bar with new model and token validity
 	}
 
 	const clearState = () => {
@@ -132,14 +123,9 @@ function setupAutocomplete(context: vscode.ExtensionContext): vscode.Disposable 
 		activeRequestId = requestId
 		animationManager.startAnimation()
 
-		const snippets = [
-			...generateImportSnippets(true, codeContext.imports, document.uri.fsPath),
-			...generateDefinitionSnippets(true, codeContext.definitions),
-		]
-		const systemPrompt = holeFillerTemplate.getSystemPrompt()
-		const userPrompt = holeFillerTemplate.template(codeContext, document, position, snippets)
+		const { systemPrompt, userPrompt } = holeFillerStrategy.getCompletionPrompts(document, position, codeContext)
 
-		console.log(`🚀🧶🧶🧶🧶🧶🧶🧶🧶🧶🧶🧶🧶🧶🧶🧶\n`, { userPrompt })
+		console.log(`🚀🧶🧶🧶🧶🧶🧶🧶🧶🧶🧶🧶🧶🧶🧶🧶\n`, userPrompt)
 
 		const stream = apiHandler.createMessage(systemPrompt, [
 			{ role: "user", content: [{ type: "text", text: userPrompt }] },
@@ -158,7 +144,7 @@ function setupAutocomplete(context: vscode.ExtensionContext): vscode.Disposable 
 
 				if (chunk.type === "text") {
 					completion += chunk.text
-					processedCompletion = processModelResponse(completion)
+					processedCompletion = holeFillerStrategy.parseResponse(completion)
 					lineCount += processedCompletion.split("/n").length
 				} else if (chunk.type === "usage") {
 					completionCost = chunk.totalCost ?? 0
@@ -177,9 +163,6 @@ function setupAutocomplete(context: vscode.ExtensionContext): vscode.Disposable 
 		// Update cost tracking variables
 		totalSessionCost += completionCost
 		lastCompletionCost = completionCost
-		console.log(`🚀💰 Completion cost: ${humanFormatCost(completionCost)}`)
-
-		// Update status bar with cost information
 		updateStatusBar()
 
 		if (activeRequestId === requestId) {
@@ -193,20 +176,21 @@ function setupAutocomplete(context: vscode.ExtensionContext): vscode.Disposable 
 
 	const provider: vscode.InlineCompletionItemProvider = {
 		async provideInlineCompletionItems(document, position, context, token) {
-			if (!enabled || !vscode.window.activeTextEditor) return null
-
-			const kilocodeToken = ContextProxy.instance.getProviderSettings().kilocodeToken
-			if (!kilocodeToken) {
-				return null
-			}
-
-			// Create or recreate the API handler if needed
-			apiHandler =
-				apiHandler ??
-				buildApiHandler({ apiProvider: "kilocode", kilocodeToken: kilocodeToken, kilocodeModel: DEFAULT_MODEL })
+			if (!enabled || !vscode.window.activeTextEditor || !apiHandler) return null
 
 			// Skip providing completions if this was triggered by a backspace operation of if we just accepted a suggestion
 			if (isBackspaceOperation || justAcceptedSuggestion) {
+				return null
+			}
+
+			// Check if we're at the start of a line with only whitespace before cursor
+			const lineText = document.lineAt(position.line).text
+			const textBeforeCursor = lineText.substring(0, position.character)
+
+			// If we're in whitespace at the start of a line (e.g., indenting with tab), don't trigger autocomplete
+			// But allow autocomplete if we're at the end of a line that consists only of whitespace
+			if (textBeforeCursor.trim() === "" && position.character !== lineText.length) {
+				console.log(`🚀⚪ Skipping autocomplete in whitespace at start of line`)
 				return null
 			}
 
@@ -219,33 +203,33 @@ function setupAutocomplete(context: vscode.ExtensionContext): vscode.Disposable 
 			const codeContext = await contextGatherer.gatherContext(document, position, true, true)
 
 			// Check if we have a cached completion for this context
-			const cacheKey = generateCacheKey(codeContext)
-			const cachedCompletions = completionsCache.get(cacheKey) ?? []
+			const cachedCompletions = autocompleteCache.getByContext(codeContext) ?? []
 			for (const completion of cachedCompletions) {
 				if (completion.startsWith(linePrefix)) {
-					// Only show the remaining part of the completion
-					const remainingSuffix = completion.substring(linePrefix.length)
-					if (remainingSuffix.length > 0) {
-						console.log(`🚀🎯 Using cached completions (${cachedCompletions.length} options)`)
+					const processedResult = processTextInsertion({ document, position, textToInsert: completion })
+					if (processedResult) {
+						console.log(
+							`🚀🎯 Using cached completion '${processedResult.processedText}' (${cachedCompletions.length} options)`,
+						)
 						animationManager.stopAnimation()
-						return [createInlineCompletionItem(remainingSuffix, position)]
+						return [createInlineCompletionItem(processedResult.processedText, processedResult.insertRange)]
 					}
 				}
 			}
 
-			const result = await debouncedGenerateCompletion({ document, codeContext, position })
-			if (!result || token.isCancellationRequested) {
+			const generationResult = await debouncedGenerateCompletion({ document, codeContext, position })
+			if (!generationResult || token.isCancellationRequested) {
 				return null
 			}
-			const { processedCompletion, cost } = result
+			const { processedCompletion, cost } = generationResult
 			console.log(`🚀🛑🚀🛑🚀🛑🚀🛑🚀🛑 \n`, {
 				processedCompletion,
-				cost: humanFormatCost(cost || 0),
+				cost: cost,
 			})
 
 			// Cache the successful completion for future use
 			if (processedCompletion) {
-				const completions = completionsCache.get(cacheKey) ?? []
+				const completions = autocompleteCache.getByContext(codeContext) ?? []
 
 				// Add the new completion if it's not already in the list
 				if (!completions.includes(processedCompletion)) {
@@ -258,61 +242,26 @@ function setupAutocomplete(context: vscode.ExtensionContext): vscode.Disposable 
 						completions.splice(0, completions.length - MAX_COMPLETIONS_PER_CONTEXT)
 					}
 				}
-				completionsCache.set(cacheKey, completions)
+				autocompleteCache.setByContext(codeContext, completions)
 			}
 
-			return [createInlineCompletionItem(processedCompletion, position)]
+			const processedResult = processTextInsertion({ document, position, textToInsert: processedCompletion })
+			if (processedResult) {
+				return [createInlineCompletionItem(processedResult.processedText, processedResult.insertRange)]
+			}
+			return null
 		},
 	}
 
 	// Register provider and commands
 	const providerDisposable = vscode.languages.registerInlineCompletionItemProvider({ pattern: "**" }, provider)
 
-	// Status bar
-	const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100)
-	statusBar.text = "$(sparkle) Kilo Complete"
-	statusBar.tooltip = "Kilo Code Autocomplete"
-	statusBar.command = "kilo-code.toggleAutocomplete"
-	statusBar.show()
-
-	// Helper function to format cost with special handling for small amounts
-	const humanFormatCost = (cost: number): string => {
-		if (cost === 0) return "$0.00"
-		if (cost > 0 && cost < 0.01) return "<$0.01" // Less than one cent
-		return `$${cost.toFixed(2)}`
-	}
-
-	// Helper function to update status bar with cost information
-	const updateStatusBar = () => {
-		if (!enabled) {
-			statusBar.text = "$(circle-slash) Kilo Complete"
-			statusBar.tooltip = "Kilo Code Autocomplete (disabled)"
-			return
-		}
-
-		// Check if kilocode token is set
-		const kilocodeToken = ContextProxy.instance.getProviderSettings().kilocodeToken
-		if (!kilocodeToken) {
-			statusBar.text = "$(warning) Kilo Complete"
-			statusBar.tooltip = "A valid Kilocode token must be set to use autocomplete"
-			return
-		}
-
-		const totalCostFormatted = humanFormatCost(totalSessionCost)
-		statusBar.text = `$(sparkle) Kilo Complete (${totalCostFormatted})`
-		statusBar.tooltip = `\
-Kilo Code Autocomplete
-
-Last completion: $${lastCompletionCost.toFixed(5)}
-Session total cost: ${totalCostFormatted}
-Model: ${DEFAULT_MODEL}\
-`
-	}
-
 	const toggleCommand = vscode.commands.registerCommand("kilo-code.toggleAutocomplete", () => {
 		enabled = !enabled
 		updateStatusBar()
-		vscode.window.showInformationMessage(`Kilo Complete ${enabled ? "enabled" : "disabled"}`)
+		vscode.window.showInformationMessage(
+			t("kilocode:autocomplete.toggleMessage", { status: enabled ? "enabled" : "disabled" }),
+		)
 	})
 
 	// Command to track when a suggestion is accepted
@@ -369,27 +318,11 @@ Model: ${DEFAULT_MODEL}\
 	// Still register with context for safety
 	context.subscriptions.push(disposable)
 
-	// Initialize status bar with correct state
+	// Initialize the handler and status bar
+	updateApiHandler(providerSettingsManager).catch((error) => {
+		console.warn("Failed to initialize autocomplete API handler:", error)
+	})
 	updateStatusBar()
 
 	return disposable
-}
-
-/**
- * Creates an inline completion item with tracking command
- * @param completionText The text to be inserted as completion
- * @param insertRange The range where the completion should be inserted
- * @param position The position in the document
- * @returns A configured vscode.InlineCompletionItem
- */
-function createInlineCompletionItem(completionText: string, position: vscode.Position): vscode.InlineCompletionItem {
-	const insertRange = new vscode.Range(position, position)
-
-	return Object.assign(new vscode.InlineCompletionItem(completionText, insertRange), {
-		command: {
-			command: "kilo-code.trackAcceptedSuggestion",
-			title: "Track Accepted Suggestion",
-			arguments: [completionText, position],
-		},
-	})
 }

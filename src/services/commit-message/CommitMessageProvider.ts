@@ -1,8 +1,9 @@
+// kilocode_change - new file
 import * as vscode from "vscode"
 import { ContextProxy } from "../../core/config/ContextProxy"
 import { ProviderSettingsManager } from "../../core/config/ProviderSettingsManager"
 import { singleCompletionHandler } from "../../utils/single-completion-handler"
-import { GitExtensionService, GitChange } from "./GitExtensionService"
+import { GitExtensionService, GitChange, GitProgressOptions } from "./GitExtensionService"
 import { supportPrompt } from "../../shared/support-prompt"
 import { t } from "../../i18n"
 import type { ProviderSettings } from "@roo-code/types"
@@ -49,10 +50,11 @@ export class CommitMessageProvider {
 			this.generateCommitMessage(),
 		)
 		this.context.subscriptions.push(disposable)
+		this.context.subscriptions.push(this.gitService)
 	}
 
 	/**
-	 * Generates an AI-powered commit message based on staged changes.
+	 * Generates an AI-powered commit message based on staged changes, or unstaged changes if no staged changes exist.
 	 */
 	public async generateCommitMessage(): Promise<void> {
 		await vscode.window.withProgress(
@@ -63,20 +65,39 @@ export class CommitMessageProvider {
 			},
 			async (progress) => {
 				try {
-					progress.report({ increment: 25, message: t("kilocode:commitMessage.analyzingChanges") })
+					let staged = true
+					let changes = await this.gitService.gatherChanges({ staged })
 
-					const changes = await this.gitService.gatherStagedChanges()
-					if (changes === null) {
-						vscode.window.showInformationMessage(t("kilocode:commitMessage.noStagedChangesRepo"))
-						return
-					}
 					if (changes.length === 0) {
-						vscode.window.showInformationMessage(t("kilocode:commitMessage.noStagedChanges"))
-						return
+						staged = false
+						changes = await this.gitService.gatherChanges({ staged })
+						if (changes.length > 0) {
+							vscode.window.showInformationMessage(t("kilocode:commitMessage.generatingFromUnstaged"))
+						} else {
+							vscode.window.showInformationMessage(t("kilocode:commitMessage.noChanges"))
+							return
+						}
 					}
 
-					const gitContextString = this.gitService.getCommitContext(changes)
-					progress.report({ increment: 50, message: t("kilocode:commitMessage.generating") })
+					// Report initial progress after gathering changes (10% of total)
+					progress.report({ increment: 10, message: t("kilocode:commitMessage.generating") })
+
+					// Track progress for diff collection (70% of total progress)
+					let lastReportedProgress = 0
+					const onDiffProgress = (percentage: number) => {
+						const currentProgress = (percentage / 100) * 70
+						const increment = currentProgress - lastReportedProgress
+						if (increment > 0) {
+							progress.report({ increment, message: t("kilocode:commitMessage.generating") })
+							lastReportedProgress = currentProgress
+						}
+					}
+
+					const gitContextString = await this.gitService.getCommitContext(changes, {
+						staged,
+						onProgress: onDiffProgress,
+					})
+					progress.report({ increment: 10, message: t("kilocode:commitMessage.generating") })
 
 					const generatedMessage = await this.callAIForCommitMessage(gitContextString)
 					this.gitService.setCommitMessage(generatedMessage)
@@ -85,8 +106,7 @@ export class CommitMessageProvider {
 					this.previousGitContext = gitContextString
 					this.previousCommitMessage = generatedMessage
 
-					progress.report({ increment: 100, message: "Complete!" })
-					vscode.window.showInformationMessage(t("kilocode:commitMessage.generated"))
+					progress.report({ increment: 10, message: t("kilocode:commitMessage.generated") })
 				} catch (error) {
 					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred"
 					vscode.window.showErrorMessage(t("kilocode:commitMessage.generationFailed", { errorMessage }))
@@ -191,5 +211,9 @@ FINAL REMINDER: Your message MUST be COMPLETELY DIFFERENT from the previous mess
 		const withoutQuotes = withoutCodeBlocks.replace(/^["'`]|["'`]$/g, "")
 
 		return withoutQuotes.trim()
+	}
+
+	public dispose() {
+		this.gitService.dispose()
 	}
 }

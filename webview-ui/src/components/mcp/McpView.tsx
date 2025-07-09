@@ -29,14 +29,15 @@ import { Tab, TabContent, TabHeader } from "../common/Tab"
 
 import McpToolRow from "./McpToolRow"
 import McpResourceRow from "./McpResourceRow"
-import McpEnabledToggle from "./McpEnabledToggle"
+// import McpEnabledToggle from "./McpEnabledToggle" // kilocode_change not used
 import { McpErrorRow } from "./McpErrorRow"
 
 type McpViewProps = {
 	onDone: () => void
+	hideHeader?: boolean // kilocode_change
 }
 
-const McpView = ({ onDone }: McpViewProps) => {
+const McpView = ({ onDone, hideHeader = false }: McpViewProps) => {
 	const {
 		mcpServers: servers,
 		alwaysAllowMcp,
@@ -48,8 +49,10 @@ const McpView = ({ onDone }: McpViewProps) => {
 	const { t } = useAppTranslation()
 
 	return (
-		<Tab>
-			<TabHeader className="flex justify-between items-center">
+		// kilocode_change: add relative className
+		<Tab className="relative">
+			{/*  kilocode_change: display header conditionally */}
+			<TabHeader style={{ display: hideHeader ? "none" : "flex" }} className="flex justify-between items-center">
 				<h3 className="text-vscode-foreground m-0">{t("mcp:title")}</h3>
 				<Button onClick={onDone}>{t("mcp:done")}</Button>
 			</TabHeader>
@@ -64,18 +67,19 @@ const McpView = ({ onDone }: McpViewProps) => {
 					}}>
 					<Trans i18nKey="mcp:description">
 						<VSCodeLink
-							href={buildDocLink("features/mcp/using-mcp-in-roo", "mcp_settings")}
+							href={buildDocLink("features/mcp/using-mcp-in-kilo-code", "mcp_settings")}
 							style={{ display: "inline" }}>
 							Learn More
 						</VSCodeLink>
 					</Trans>
 				</div>
 
-				<McpEnabledToggle />
+				{/* <McpEnabledToggle /> kilocode_change: we always enable MCP */}
 
 				{mcpEnabled && (
 					<>
-						<div style={{ marginBottom: 15 }}>
+						{/* kilocode_change: display: none; we always allow mcp server creation */}
+						<div style={{ display: "none", marginBottom: 15 }}>
 							<VSCodeCheckbox
 								checked={enableMcpServerCreation}
 								onChange={(e: any) => {
@@ -93,7 +97,7 @@ const McpView = ({ onDone }: McpViewProps) => {
 								<Trans i18nKey="mcp:enableServerCreation.description">
 									<VSCodeLink
 										href={buildDocLink(
-											"features/mcp/using-mcp-in-roo#how-to-use-roo-to-create-an-mcp-server",
+											"features/mcp/using-mcp-in-kilo-code#how-to-use-kilo-code-to-create-an-mcp-server",
 											"mcp_server_creation",
 										)}
 										style={{ display: "inline" }}>
@@ -163,7 +167,7 @@ const McpView = ({ onDone }: McpViewProps) => {
 							}}>
 							<VSCodeLink
 								href={buildDocLink(
-									"features/mcp/using-mcp-in-roo#editing-mcp-settings-files",
+									"features/mcp/using-mcp-in-kilo-code#editing-mcp-settings-files",
 									"mcp_edit_settings",
 								)}
 								style={{ display: "inline" }}>
